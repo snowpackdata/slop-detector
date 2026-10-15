@@ -643,13 +643,129 @@ class SlopScanner {
         let lowerWords = words.map { $0.lowercased() }
         let iCount = lowerWords.filter { $0 == "i" || $0 == "i'm" || $0 == "i've" || $0 == "i'd" || $0 == "i'll" || $0 == "my" || $0 == "me" }.count
         let firstPersonDensity = Double(iCount) / Double(max(words.count, 1))
-        // In multi-paragraph text that reads like a message/email, zero first-person is suspicious
         if words.count >= 60 && firstPersonDensity < 0.005 && sentences.count >= 5 {
             findings.append(Finding(
                 severity: .info, category: .grammar,
                 name: "No first-person voice",
                 reason: "Long text with no I/me/my — unusual for human-written messages",
                 count: 1
+            ))
+        }
+
+        // ── Dropped-subject sentences ─────────────────────────────────
+        // AI writes "Works on bytes" / "Returns the value" / "Handles the request"
+        // — sentences with no subject, just a bare third-person verb.
+        // Humans write "It works on bytes" or "The parser works on bytes".
+        let droppedSubjectRegex = try! NSRegularExpression(
+            pattern: #"^(Works|Runs|Returns|Handles|Sends|Takes|Makes|Gives|Gets|Keeps|Puts|Sets|Lets|Adds|Uses|Calls|Creates|Builds|Reads|Writes|Checks|Parses|Loads|Stores|Fetches|Pulls|Pushes|Passes|Maps|Converts|Transforms|Wraps|Strips|Splits|Joins|Merges|Triggers|Fires|Emits|Throws|Catches|Logs|Tracks|Counts|Finds|Looks|Grabs|Drops|Skips|Falls|Sits|Helps|Allows|Enables|Ensures|Provides|Supports|Includes|Contains|Represents|Defines|Specifies|Indicates|Shows|Displays|Renders|Formats|Applies|Accepts|Receives|Validates|Prevents|Avoids|Ignores|Defaults|Assumes|Expects|Requires|Needs|Depends|Connects|Points|Refers|Links)\b"#,
+            options: []
+        )
+
+        var droppedSubjectCount = 0
+        var droppedExamples: [String] = []
+        for sent in sentences {
+            let trimmed = sent.trimmingCharacters(in: .whitespaces)
+            let nsRange = NSRange(location: 0, length: (trimmed as NSString).length)
+            if droppedSubjectRegex.firstMatch(in: trimmed, range: nsRange) != nil {
+                droppedSubjectCount += 1
+                if droppedExamples.count < 2 {
+                    let preview = String(trimmed.prefix(50))
+                    droppedExamples.append(preview)
+                }
+            }
+        }
+        if droppedSubjectCount >= 2 {
+            let examples = droppedExamples.map { "\"\($0)…\"" }.joined(separator: ", ")
+            findings.append(Finding(
+                severity: .info, category: .grammar,
+                name: "Dropped subjects (\(droppedSubjectCount)×)",
+                reason: "Sentences with no subject, bare verb opening — \(examples)",
+                count: droppedSubjectCount
+            ))
+        }
+
+        // ── Tool/abstraction personification ──────────────────────────
+        // AI gives agency to products and abstractions:
+        //   "Fivetran has the headline" — no, a column in a synced table contains it
+        //   "The UTM names the session" — no, it contains a value referencing one
+        //   "Redis knows about the key" — no, Redis stores a key
+        //   "The config handles retries" — no, the retry logic reads the config
+        //
+        // Pattern: [Product/abstraction noun] + [anthropomorphic verb]
+        // We look for capitalized nouns (likely product names) or common
+        // abstraction nouns followed by verbs that imply human-like agency.
+        let personificationRegex = try! NSRegularExpression(
+            pattern: #"(?:^|[.!?]\s+)(?:The |the |)([A-Z][a-zA-Z]*(?:\s[A-Z][a-zA-Z]*)?)\s+(knows?|sees?|thinks?|believes?|decides?|wants?|has|have|had|realizes?|recognizes?|understands?|determines?|identifies?|considers?|expects?|assumes?|remembers?|forgets?|learns?|notices?|discovers?|figures?|feels?|cares?|minds?|worries|prefers?|chooses?|picks?|likes?|hates?|loves?|enjoys?|watches?|listens?|tells?|says?|speaks?|asks?|answers?|names?|calls?)\b"#,
+            options: []
+        )
+        // Also catch lowercase abstraction nouns
+        let abstractionRegex = try! NSRegularExpression(
+            pattern: #"\b(the\s+)(config|configuration|pipeline|workflow|endpoint|API|UTM|URL|query|schema|migration|cron|job|script|function|method|module|package|library|framework|service|server|database|cache|queue|proxy|gateway|router|middleware|handler|controller|scheduler|daemon|container|cluster|pod|node|bucket|table|column|field|index|view|model|template|plugin|extension|hook|trigger|webhook|listener|worker|task|process|thread|runtime|compiler|parser|linter|formatter|bundler|loader|resolver|adapter|connector|driver|client|provider|factory|wrapper|helper|utility|manager|registry|store|repository|broker|monitor|logger|profiler|debugger|tracer|emitter|dispatcher|orchestrator|coordinator|aggregator|transformer|serializer|validator|sanitizer|normalizer|tokenizer|encoder|decoder|encryptor|compressor|buffer|stream|socket|channel|transport|protocol)\s+(knows?|sees?|thinks?|believes?|decides?|wants?|has|have|had|realizes?|recognizes?|understands?|determines?|identifies?|considers?|expects?|assumes?|remembers?|forgets?|learns?|notices?|discovers?|feels?|cares?|minds?|worries|prefers?|chooses?|names?|calls?|tells?|says?)\b"#,
+            options: [.caseInsensitive]
+        )
+
+        // Common product names that get personified
+        let productNames: Set<String> = [
+            "fivetran", "airflow", "dbt", "snowflake", "bigquery", "redshift",
+            "postgres", "postgresql", "mysql", "mongodb", "redis", "kafka",
+            "elasticsearch", "docker", "kubernetes", "terraform", "jenkins",
+            "github", "gitlab", "jira", "confluence", "slack", "stripe",
+            "twilio", "sendgrid", "datadog", "grafana", "prometheus",
+            "nginx", "apache", "webpack", "babel", "eslint", "prettier",
+            "react", "angular", "vue", "nextjs", "vercel", "netlify",
+            "aws", "gcp", "azure", "heroku", "railway",
+            "segment", "amplitude", "mixpanel", "hubspot", "salesforce",
+            "gusto", "rippling", "looker", "tableau", "metabase",
+            "sentry", "pagerduty", "opsgenie", "circleci", "travisci",
+            "npm", "yarn", "pip", "cargo", "maven", "gradle",
+            "celery", "sidekiq", "resque", "bull",
+        ]
+
+        var personificationCount = 0
+        var personificationExamples: [String] = []
+
+        for sent in sentences {
+            let nsSent = sent as NSString
+            let range = NSRange(location: 0, length: nsSent.length)
+
+            // Check for Capitalized Name + agency verb
+            let pMatches = personificationRegex.matches(in: sent, range: range)
+            for m in pMatches {
+                if m.numberOfRanges >= 2 {
+                    let name = nsSent.substring(with: m.range(at: 1)).lowercased()
+                    // Skip common human-subject words
+                    let humanWords: Set<String> = ["i", "we", "you", "he", "she", "they", "it",
+                        "someone", "anyone", "everyone", "nobody", "people", "team", "user",
+                        "users", "client", "clients", "customer", "admin", "staff", "manager",
+                        "developer", "engineer", "analyst", "designer", "lead", "director"]
+                    if humanWords.contains(name) { continue }
+                    // Check if it's a known product
+                    if productNames.contains(name) {
+                        personificationCount += 1
+                        if personificationExamples.count < 2 {
+                            personificationExamples.append(String(sent.prefix(60)))
+                        }
+                    }
+                }
+            }
+
+            // Check for "the [abstraction] [agency verb]"
+            let aMatches = abstractionRegex.matches(in: sent, range: range)
+            if !aMatches.isEmpty {
+                personificationCount += aMatches.count
+                if personificationExamples.count < 2 {
+                    personificationExamples.append(String(sent.prefix(60)))
+                }
+            }
+        }
+
+        if personificationCount >= 1 {
+            let examples = personificationExamples.map { "\"\($0)…\"" }.joined(separator: "; ")
+            findings.append(Finding(
+                severity: .info, category: .grammar,
+                name: "Tool/abstraction personification (\(personificationCount)×)",
+                reason: "Gives human agency to products or abstractions — \(examples)",
+                count: personificationCount
             ))
         }
 

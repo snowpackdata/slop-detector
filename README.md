@@ -1,25 +1,8 @@
 # Slop Detector
 
-A native macOS menu bar app that detects AI-generated text. Highlight text anywhere, press **⌘⇧D**, and get an instant, explainable breakdown of what looks like slop.
+Menu bar app for macOS. Highlight text, hit **⌘⇧D**, see how much of it is AI.
 
-No API calls. No network. Everything runs locally on-device.
-
-## What it detects
-
-**Heuristic engine** (always on, 250KB binary):
-- **Invisible Unicode** — zero-width spaces, BOM, directional overrides
-- **AI-style punctuation** — em dashes, curly quotes, horizontal ellipsis
-- **LLM phrases** — "delve", "it's worth noting", "tapestry of", and 80+ more patterns
-- **Statistical signals** — sentence uniformity, vocabulary diversity, hedge word density, burstiness
-- **Grammar patterns** — passive voice, dropped subjects, tool personification
-- **Watermarks** — Cyrillic/Greek homoglyphs, variation selectors, tag characters
-
-**Neural model** (included, +128MB):
-- DistilBERT fine-tuned on AI vs. human text ([rasbt/ai-text-detector-distilbert](https://huggingface.co/rasbt/ai-text-detector-distilbert), 99.74% accuracy)
-- Runs via CoreML on Apple Neural Engine / GPU
-- Scores are blended: 60% neural + 40% heuristic per paragraph
-
-Text is split into paragraphs, scored independently, and rolled up to an overall AI percentage with an explainable breakdown.
+Everything runs locally. No API calls, no network, no cloud. A 250KB binary and a 128MB neural model that lives on your machine.
 
 ## Install
 
@@ -29,48 +12,50 @@ cd slop-detector
 make install
 ```
 
-This compiles the binary, downloads the neural model (117 MB, one-time), packages everything into **Slop Detector.app**, and copies it to `/Applications`. Open it from Spotlight or your Applications folder — it runs as a menu bar app with no dock icon.
+Opens from Spotlight or `/Applications`. Sits in your menu bar as `slop` — no dock icon, no terminal.
 
-Requires macOS 13+ and Xcode command line tools (`xcode-select --install`).
+Needs macOS 13+ and Xcode CLI tools (`xcode-select --install`). First run asks for Accessibility permission so it can grab your selection.
 
-## Usage
+## How it works
 
-1. Launch **Slop Detector** — it appears in your menu bar as `slop`
-2. Select text anywhere on your Mac
-3. Press **⌘⇧D**
-4. A popover shows the AI percentage and every signal it found
+You select text anywhere on your Mac and press ⌘⇧D. The app copies it, splits it into paragraphs, and scores each one two ways:
 
-You can also click the menu bar icon and choose **Scan Clipboard**.
+**Neural model** — a DistilBERT classifier fine-tuned on AI vs. human text (99.74% accuracy on its eval set). Runs on CoreML, so it hits the Neural Engine on Apple Silicon. This is the heavy hitter.
 
-### Permissions
+**Heuristic rules** — pattern matching that catches things the model might miss and makes the output explainable:
 
-On first run, macOS will ask for **Accessibility** permissions (System Settings > Privacy & Security > Accessibility). This is needed to simulate ⌘C to grab selected text.
+- Invisible Unicode (zero-width spaces, BOM, directional overrides)
+- AI punctuation (em dashes, curly quotes, horizontal ellipsis — the kind LLMs insert but people don't type)
+- ~90 LLM phrases ("delve", "it's worth noting", "navigate the complexities")
+- Statistical signals (sentence length uniformity, vocabulary repetition, hedge word density)
+- Grammar tells (dropped subjects, passive voice, tool personification — "Fivetran has the headline")
+- Watermarks (Cyrillic homoglyphs, variation selectors)
 
-## Detection rules
+The final score blends both: 60% neural, 40% heuristic. The popover shows the overall percentage, per-paragraph scores, and every signal that fired.
 
-Heuristic rules based on [llm-slop-detector](https://github.com/mandakan/llm-slop-detector) (MIT). Everything is compiled into the binary — no config files or runtime downloads.
+## Updating
 
-| Category | Examples |
-|----------|----------|
-| Invisible chars | Zero-width space, BOM, soft hyphen |
-| AI punctuation | Em dash, curly quotes, ellipsis |
-| LLM phrases | "delve", "leverage", "tapestry of" |
-| Statistical | Sentence uniformity, low vocab diversity |
-| Grammar | Passive voice, dropped subjects, personification |
-| Watermarks | Cyrillic homoglyphs, variation selectors |
-| Neural | DistilBERT AI text classifier (CoreML) |
-
-## Build
+The app checks GitHub for new releases on launch. You can also click `slop` in the menu bar → **Check for Updates**. When there's a new version:
 
 ```bash
-make build      # compile binary only
-make setup      # download neural model (117 MB)
-make app        # build + package .app bundle
-make install    # build + install to /Applications
-make run        # build + launch from terminal
-make clean      # remove binary, model, and .app
+cd slop-detector
+git pull
+make install
 ```
 
-## License
+## Build targets
 
-MIT. Detection rules derived from [mandakan/llm-slop-detector](https://github.com/mandakan/llm-slop-detector) (MIT).
+```
+make build      # compile the binary
+make setup      # download the neural model (117 MB, one-time)
+make app        # compile + package Slop Detector.app
+make install    # all of the above + copy to /Applications
+make run        # compile + run from terminal
+make clean      # delete everything generated
+```
+
+## Credits
+
+Detection rules started from [mandakan/llm-slop-detector](https://github.com/mandakan/llm-slop-detector) (MIT). Neural model is [rasbt/ai-text-detector-distilbert](https://huggingface.co/rasbt/ai-text-detector-distilbert).
+
+MIT license.

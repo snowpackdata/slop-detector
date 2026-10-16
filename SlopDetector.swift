@@ -3,6 +3,10 @@ import Carbon
 import CoreML
 import UserNotifications
 
+let appVersion = "1.1.0"
+let repoOwner = "snowpackdata"
+let repoName = "slop-detector"
+
 // MARK: - Sensitivity
 
 enum Sensitivity: Int, CaseIterable {
@@ -1406,6 +1410,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
         sendNotification(title: "Slop Detector", body: "Running (\(sensitivity.menuLabel)). Press \u{2318}\u{21E7}D with text selected.")
+        checkForUpdates(silent: true)
     }
 
     func sendNotification(title: String, body: String) {
@@ -1434,6 +1439,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         sensitivityItem.submenu = sensitivityMenu
         menu.addItem(sensitivityItem)
 
+        menu.addItem(NSMenuItem.separator())
+        let updateItem = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdatesManual), keyEquivalent: "")
+        updateItem.target = self
+        menu.addItem(updateItem)
+        let versionItem = NSMenuItem(title: "v\(appVersion)", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -1571,6 +1583,69 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // NSPopoverDelegate — clean up monitors when popover closes for any reason
     func popoverDidClose(_ notification: Notification) {
         removeDismissMonitors()
+    }
+
+    // ── Update checker ─────────────────────────────────────────────────
+    @objc func checkForUpdatesManual() { checkForUpdates(silent: false) }
+
+    func checkForUpdates(silent: Bool) {
+        let urlStr = "https://api.github.com/repos/\(repoOwner)/\(repoName)/releases/latest"
+        guard let url = URL(string: urlStr) else { return }
+
+        var request = URLRequest(url: url)
+        request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 10
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            guard let data = data, error == nil,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tagName = json["tag_name"] as? String else {
+                if !silent {
+                    DispatchQueue.main.async {
+                        self?.sendNotification(title: "Slop Detector", body: "Could not check for updates.")
+                    }
+                }
+                return
+            }
+
+            let remote = tagName.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
+            if self?.isNewerVersion(remote, than: appVersion) == true {
+                let releaseURL = json["html_url"] as? String ?? "https://github.com/\(repoOwner)/\(repoName)/releases"
+                DispatchQueue.main.async {
+                    self?.promptUpdate(version: remote, url: releaseURL)
+                }
+            } else if !silent {
+                DispatchQueue.main.async {
+                    self?.sendNotification(title: "Slop Detector", body: "You're up to date (v\(appVersion)).")
+                }
+            }
+        }.resume()
+    }
+
+    private func isNewerVersion(_ remote: String, than local: String) -> Bool {
+        let r = remote.split(separator: ".").compactMap { Int($0) }
+        let l = local.split(separator: ".").compactMap { Int($0) }
+        for i in 0..<max(r.count, l.count) {
+            let rv = i < r.count ? r[i] : 0
+            let lv = i < l.count ? l[i] : 0
+            if rv > lv { return true }
+            if rv < lv { return false }
+        }
+        return false
+    }
+
+    private func promptUpdate(version: String, url: String) {
+        let alert = NSAlert()
+        alert.messageText = "Update Available"
+        alert.informativeText = "Slop Detector v\(version) is available (you have v\(appVersion)).\n\nRun `git pull && make install` to update."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open Release")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            if let releaseURL = URL(string: url) {
+                NSWorkspace.shared.open(releaseURL)
+            }
+        }
     }
 
     @objc func quit() {

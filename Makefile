@@ -23,6 +23,7 @@ app: build setup
 	@mkdir -p "$(APP_NAME)/Contents/Resources"
 	@cp slop-detector "$(APP_NAME)/Contents/MacOS/"
 	@cp Info.plist "$(APP_NAME)/Contents/"
+	@cp AppIcon.icns "$(APP_NAME)/Contents/Resources/"
 	@cp -R model "$(APP_NAME)/Contents/Resources/model"
 	@echo "Built $(APP_NAME)"
 

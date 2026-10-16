@@ -1480,49 +1480,60 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc func scanSelected() {
-        // Dismiss any open popover first so the target app regains focus
+        // Dismiss any open popover so the target app has focus
         dismissPopover()
 
-        // Small delay to let the target app become frontmost again
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.performCopyAndScan()
-        }
-    }
-
-    private func performCopyAndScan() {
         let pasteboard = NSPasteboard.general
         let savedChangeCount = pasteboard.changeCount
 
-        // Simulate ⌘C
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let cDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)
-        let cUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
-        cDown?.flags = CGEventFlags.maskCommand
-        cUp?.flags = CGEventFlags.maskCommand
-        cDown?.post(tap: .cgSessionEventTap)
-        cUp?.post(tap: .cgSessionEventTap)
+        // Try AppleScript first — it's more reliable than CGEvent for ⌘C
+        DispatchQueue.global(qos: .userInitiated).async {
+            let script = NSAppleScript(source: """
+                tell application "System Events"
+                    keystroke "c" using command down
+                end tell
+            """)
+            var error: NSDictionary?
+            script?.executeAndReturnError(&error)
 
-        // Poll for clipboard change — some apps are slow
-        waitForClipboard(savedChangeCount: savedChangeCount, attempt: 0)
+            // Wait for clipboard, then scan on main thread
+            Thread.sleep(forTimeInterval: 0.3)
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+
+                if pasteboard.changeCount != savedChangeCount,
+                   let text = pasteboard.string(forType: .string),
+                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.runScan(text)
+                } else {
+                    // AppleScript didn't work — try CGEvent as fallback
+                    self.tryCGEventCopy(savedChangeCount: savedChangeCount)
+                }
+            }
+        }
     }
 
-    private func waitForClipboard(savedChangeCount: Int, attempt: Int) {
-        let delay: Double = attempt == 0 ? 0.15 : 0.25
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+    private func tryCGEventCopy(savedChangeCount: Int) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let cDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)
+        let cUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
+        cDown?.flags = .maskCommand
+        cUp?.flags = .maskCommand
+        cDown?.post(tap: .cghidEventTap)
+        cUp?.post(tap: .cghidEventTap)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self else { return }
             let pasteboard = NSPasteboard.general
 
             if pasteboard.changeCount != savedChangeCount,
                let text = pasteboard.string(forType: .string),
                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // New text was copied
                 self.runScan(text)
-            } else if attempt < 2 {
-                // Retry — give the target app more time
-                self.waitForClipboard(savedChangeCount: savedChangeCount, attempt: attempt + 1)
             } else if let text = pasteboard.string(forType: .string),
                       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // ⌘C didn't change the clipboard — scan whatever's there
+                // Neither method changed the clipboard — scan what's there
                 self.runScan(text)
             } else {
                 self.sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first.")

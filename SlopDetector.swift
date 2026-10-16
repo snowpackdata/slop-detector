@@ -1480,10 +1480,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc func scanSelected() {
+        // Dismiss any open popover first so the target app regains focus
+        dismissPopover()
+
+        // Small delay to let the target app become frontmost again
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.performCopyAndScan()
+        }
+    }
+
+    private func performCopyAndScan() {
         let pasteboard = NSPasteboard.general
         let savedChangeCount = pasteboard.changeCount
 
-        // Simulate ⌘C to copy the selection
+        // Simulate ⌘C
         let source = CGEventSource(stateID: .combinedSessionState)
         let cDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)
         let cUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
@@ -1492,12 +1502,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         cDown?.post(tap: .cgSessionEventTap)
         cUp?.post(tap: .cgSessionEventTap)
 
-        // Wait for clipboard to update, retry once if slow
+        // Poll for clipboard change — some apps are slow
         waitForClipboard(savedChangeCount: savedChangeCount, attempt: 0)
     }
 
     private func waitForClipboard(savedChangeCount: Int, attempt: Int) {
-        let delay: Double = attempt == 0 ? 0.2 : 0.3
+        let delay: Double = attempt == 0 ? 0.15 : 0.25
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self = self else { return }
             let pasteboard = NSPasteboard.general
@@ -1505,10 +1515,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if pasteboard.changeCount != savedChangeCount,
                let text = pasteboard.string(forType: .string),
                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // New text was copied
                 self.runScan(text)
-            } else if attempt == 0 {
-                // Retry once — some apps are slow to respond to ⌘C
-                self.waitForClipboard(savedChangeCount: savedChangeCount, attempt: 1)
+            } else if attempt < 2 {
+                // Retry — give the target app more time
+                self.waitForClipboard(savedChangeCount: savedChangeCount, attempt: attempt + 1)
+            } else if let text = pasteboard.string(forType: .string),
+                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // ⌘C didn't change the clipboard — scan whatever's there
+                self.runScan(text)
             } else {
                 self.sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first.")
             }
@@ -1600,7 +1615,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc func checkForUpdatesManual() { checkForUpdates(silent: false) }
 
     func checkForUpdates(silent: Bool) {
-        let urlStr = "https://api.github.com/repos/\(repoOwner)/\(repoName)/releases/latest"
+        // Fetch all releases — /releases/latest may point to a non-app release (e.g. model data)
+        let urlStr = "https://api.github.com/repos/\(repoOwner)/\(repoName)/releases?per_page=10"
         guard let url = URL(string: urlStr) else { return }
 
         var request = URLRequest(url: url)
@@ -1609,8 +1625,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
             guard let data = data, error == nil,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tagName = json["tag_name"] as? String else {
+                  let releases = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
                 if !silent {
                     DispatchQueue.main.async {
                         self?.sendNotification(title: "Slop Detector", body: "Could not check for updates.")
@@ -1619,13 +1634,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return
             }
 
-            let remote = tagName.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
-            if self?.isNewerVersion(remote, than: appVersion) == true {
-                let releaseURL = json["html_url"] as? String ?? "https://github.com/\(repoOwner)/\(repoName)/releases"
-                DispatchQueue.main.async {
-                    self?.promptUpdate(version: remote, url: releaseURL)
+            // Find the newest release with a semver tag (v1.2.3 or 1.2.3)
+            for release in releases {
+                guard let tagName = release["tag_name"] as? String else { continue }
+                let version = tagName.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
+                let parts = version.split(separator: ".").compactMap { Int($0) }
+                guard parts.count >= 2 else { continue } // skip non-semver tags like "model-v1.0"
+
+                if self?.isNewerVersion(version, than: appVersion) == true {
+                    let releaseURL = release["html_url"] as? String ?? "https://github.com/\(repoOwner)/\(repoName)/releases"
+                    DispatchQueue.main.async {
+                        self?.promptUpdate(version: version, url: releaseURL)
+                    }
+                } else if !silent {
+                    DispatchQueue.main.async {
+                        self?.sendNotification(title: "Slop Detector", body: "You're up to date (v\(appVersion)).")
+                    }
                 }
-            } else if !silent {
+                return // only check the first valid semver release
+            }
+
+            if !silent {
                 DispatchQueue.main.async {
                     self?.sendNotification(title: "Slop Detector", body: "You're up to date (v\(appVersion)).")
                 }

@@ -1,6 +1,7 @@
 import Cocoa
 import Carbon
 import CoreML
+import UserNotifications
 
 // MARK: - Sensitivity
 
@@ -962,10 +963,16 @@ class NeuralScorer {
     let maxLength = 512
 
     init() {
-        // Load vocabulary from tokenizer.json
+        // Look for model in bundle Resources first, then next to the executable
+        let bundleResourceDir = Bundle.main.resourcePath ?? ""
         let execPath = ProcessInfo.processInfo.arguments[0]
         let execDir = (execPath as NSString).deletingLastPathComponent
-        let modelDir = (execDir as NSString).appendingPathComponent("model")
+
+        let candidates = [
+            (bundleResourceDir as NSString).appendingPathComponent("model"),
+            (execDir as NSString).appendingPathComponent("model"),
+        ]
+        let modelDir = candidates.first { FileManager.default.fileExists(atPath: ($0 as NSString).appendingPathComponent("tokenizer.json")) } ?? candidates.last!
         let tokenizerPath = (modelDir as NSString).appendingPathComponent("tokenizer.json")
         let mlpackagePath = (modelDir as NSString).appendingPathComponent("SlopDetectorModel.mlpackage")
 
@@ -1119,6 +1126,7 @@ class NeuralScorer {
 class ResultViewController: NSViewController {
     let docResult: DocumentResult
     let scannedText: String
+    private let contentWidth: CGFloat = 380
 
     init(docResult: DocumentResult, text: String) {
         self.docResult = docResult
@@ -1129,11 +1137,13 @@ class ResultViewController: NSViewController {
     required init?(coder: NSCoder) { fatalError() }
 
     override func loadView() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 10))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: contentWidth + 40, height: 10))
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
+        scroll.scrollerStyle = .overlay
         scroll.borderType = .noBorder
+        scroll.drawsBackground = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(scroll)
         NSLayoutConstraint.activate([
@@ -1146,165 +1156,226 @@ class ResultViewController: NSViewController {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
+        stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
 
         // ── Score header ──────────────────────────────────────────────
         let scorePct = Int(docResult.overallScore)
-        let header = NSTextField(labelWithString: "\(scorePct)% AI")
-        header.font = .systemFont(ofSize: 28, weight: .bold)
-        header.textColor = docResult.overallColor
-        stack.addArrangedSubview(header)
 
+        let headerRow = NSStackView()
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .lastBaseline
+        headerRow.spacing = 8
+
+        let scoreNum = NSTextField(labelWithString: "\(scorePct)%")
+        scoreNum.font = .systemFont(ofSize: 36, weight: .heavy)
+        scoreNum.textColor = docResult.overallColor
+        headerRow.addArrangedSubview(scoreNum)
+
+        let scoreLabel = NSTextField(labelWithString: "AI")
+        scoreLabel.font = .systemFont(ofSize: 18, weight: .medium)
+        scoreLabel.textColor = docResult.overallColor.withAlphaComponent(0.7)
+        headerRow.addArrangedSubview(scoreLabel)
+
+        stack.addArrangedSubview(headerRow)
+
+        // Verdict + meta
         let hasNeural = docResult.chunks.contains { $0.neuralScore != nil }
-        let modelTag = hasNeural ? " · Neural+Heuristic" : " · Heuristic only"
-        let verdictLine = NSTextField(labelWithString: "\(docResult.verdict) · \(docResult.totalWordCount) words · \(docResult.sensitivity.menuLabel)\(modelTag)")
+        let method = hasNeural ? "Neural + Rules" : "Rules only"
+        let verdictLine = NSTextField(labelWithString: "\(docResult.verdict)  \u{00B7}  \(docResult.totalWordCount) words  \u{00B7}  \(method)")
         verdictLine.font = .systemFont(ofSize: 11)
         verdictLine.textColor = .secondaryLabelColor
         stack.addArrangedSubview(verdictLine)
+
+        addSpacer(to: stack, height: 4)
 
         // ── Score bar ─────────────────────────────────────────────────
         let barContainer = NSView()
         barContainer.translatesAutoresizingMaskIntoConstraints = false
         barContainer.wantsLayer = true
-        barContainer.layer?.cornerRadius = 4
-        barContainer.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        barContainer.layer?.cornerRadius = 3
+        barContainer.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
 
         let barFill = NSView()
         barFill.translatesAutoresizingMaskIntoConstraints = false
         barFill.wantsLayer = true
-        barFill.layer?.cornerRadius = 4
+        barFill.layer?.cornerRadius = 3
         barFill.layer?.backgroundColor = docResult.overallColor.cgColor
 
         barContainer.addSubview(barFill)
         stack.addArrangedSubview(barContainer)
 
+        let fillMultiplier = CGFloat(min(1.0, max(0.005, docResult.overallScore / 100.0)))
         NSLayoutConstraint.activate([
-            barContainer.widthAnchor.constraint(equalToConstant: 428),
-            barContainer.heightAnchor.constraint(equalToConstant: 8),
+            barContainer.widthAnchor.constraint(equalToConstant: contentWidth),
+            barContainer.heightAnchor.constraint(equalToConstant: 6),
             barFill.leadingAnchor.constraint(equalTo: barContainer.leadingAnchor),
             barFill.topAnchor.constraint(equalTo: barContainer.topAnchor),
             barFill.bottomAnchor.constraint(equalTo: barContainer.bottomAnchor),
-            barFill.widthAnchor.constraint(equalTo: barContainer.widthAnchor, multiplier: CGFloat(min(1.0, max(0.0, docResult.overallScore / 100.0)))),
+            barFill.widthAnchor.constraint(equalTo: barContainer.widthAnchor, multiplier: fillMultiplier),
         ])
 
-        // ── Per-chunk breakdown (if multiple chunks) ──────────────────
+        // ── Per-chunk breakdown ───────────────────────────────────────
         if docResult.chunks.count > 1 {
-            addSeparator(to: stack)
+            addSpacer(to: stack, height: 6)
+            addDivider(to: stack)
+            addSpacer(to: stack, height: 2)
 
-            let chunkHeader = NSTextField(labelWithString: "Per-paragraph breakdown (\(docResult.aiChunkCount) AI, \(docResult.humanChunkCount) human)")
-            chunkHeader.font = .systemFont(ofSize: 12, weight: .medium)
-            chunkHeader.textColor = .labelColor
-            stack.addArrangedSubview(chunkHeader)
+            let sectionLabel = makeSectionHeader("Paragraphs")
+            stack.addArrangedSubview(sectionLabel)
 
-            for (_, chunk) in docResult.chunks.enumerated() {
-                let chunkPct = Int(chunk.score)
-                let preview = String(chunk.text.prefix(60)).replacingOccurrences(of: "\n", with: " ")
-                let flagCount = chunk.findings.count
-                let neuralLabel = chunk.neuralScore.map { "N:\(Int($0))%" } ?? ""
-
-                let chunkView = NSView()
-                chunkView.translatesAutoresizingMaskIntoConstraints = false
-
-                // Color indicator dot
-                let dot = NSView()
-                dot.translatesAutoresizingMaskIntoConstraints = false
-                dot.wantsLayer = true
-                dot.layer?.cornerRadius = 4
-                dot.layer?.backgroundColor = chunk.color.cgColor
-                chunkView.addSubview(dot)
-
-                let pctLabel = NSTextField(labelWithString: "\(chunkPct)%")
-                pctLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-                pctLabel.textColor = chunk.color
-                pctLabel.translatesAutoresizingMaskIntoConstraints = false
-                chunkView.addSubview(pctLabel)
-
-                let textLabel = NSTextField(labelWithString: "\"\(preview)\(chunk.text.count > 70 ? "…" : "")\"")
-                textLabel.font = .systemFont(ofSize: 10)
-                textLabel.textColor = .secondaryLabelColor
-                textLabel.lineBreakMode = .byTruncatingTail
-                textLabel.translatesAutoresizingMaskIntoConstraints = false
-                chunkView.addSubview(textLabel)
-
-                let detailStr = [neuralLabel, flagCount > 0 ? "\(flagCount) flags" : ""].filter { !$0.isEmpty }.joined(separator: " · ")
-                let flagLabel = NSTextField(labelWithString: detailStr)
-                flagLabel.font = .systemFont(ofSize: 9)
-                flagLabel.textColor = .tertiaryLabelColor
-                flagLabel.translatesAutoresizingMaskIntoConstraints = false
-                chunkView.addSubview(flagLabel)
-
-                NSLayoutConstraint.activate([
-                    chunkView.heightAnchor.constraint(equalToConstant: 20),
-                    chunkView.widthAnchor.constraint(equalToConstant: 428),
-                    dot.leadingAnchor.constraint(equalTo: chunkView.leadingAnchor),
-                    dot.centerYAnchor.constraint(equalTo: chunkView.centerYAnchor),
-                    dot.widthAnchor.constraint(equalToConstant: 8),
-                    dot.heightAnchor.constraint(equalToConstant: 8),
-                    pctLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 6),
-                    pctLabel.centerYAnchor.constraint(equalTo: chunkView.centerYAnchor),
-                    pctLabel.widthAnchor.constraint(equalToConstant: 36),
-                    textLabel.leadingAnchor.constraint(equalTo: pctLabel.trailingAnchor, constant: 4),
-                    textLabel.centerYAnchor.constraint(equalTo: chunkView.centerYAnchor),
-                    textLabel.trailingAnchor.constraint(lessThanOrEqualTo: flagLabel.leadingAnchor, constant: -4),
-                    flagLabel.trailingAnchor.constraint(equalTo: chunkView.trailingAnchor),
-                    flagLabel.centerYAnchor.constraint(equalTo: chunkView.centerYAnchor),
-                ])
-
-                stack.addArrangedSubview(chunkView)
+            for chunk in docResult.chunks {
+                let row = makeChunkRow(chunk)
+                stack.addArrangedSubview(row)
             }
         }
 
-        // ── Findings detail ───────────────────────────────────────────
+        // ── Findings ──────────────────────────────────────────────────
         if !docResult.allFindings.isEmpty {
-            addSeparator(to: stack)
+            addSpacer(to: stack, height: 6)
+            addDivider(to: stack)
+            addSpacer(to: stack, height: 2)
 
-            let byCategory: [(String, Finding.Category, String)] = [
-                ("Watermark detected", .watermark, "🚨"),
-                ("Invisible Unicode", .unicode, "⚠️"),
-                ("Grammar patterns", .grammar, "📝"),
-                ("LLM phrases", .phrase, "🔵"),
-                ("Statistical signals", .statistical, "📊"),
-                ("AI-style punctuation", .punctuation, "·"),
+            let sectionLabel = makeSectionHeader("Signals")
+            stack.addArrangedSubview(sectionLabel)
+
+            let byCategory: [(String, Finding.Category)] = [
+                ("WATERMARK", .watermark),
+                ("UNICODE", .unicode),
+                ("GRAMMAR", .grammar),
+                ("PHRASES", .phrase),
+                ("STATISTICAL", .statistical),
+                ("PUNCTUATION", .punctuation),
             ]
 
-            for (title, cat, icon) in byCategory {
+            for (title, cat) in byCategory {
                 let items = docResult.allFindings.filter { $0.category == cat }
                 if items.isEmpty { continue }
 
-                let sectionTitle = NSTextField(labelWithString: "\(icon)  \(title)")
-                sectionTitle.font = .systemFont(ofSize: 12, weight: .medium)
-                sectionTitle.textColor = .labelColor
-                stack.addArrangedSubview(sectionTitle)
+                let catColor: NSColor = cat == .watermark ? .systemRed : .tertiaryLabelColor
+
+                let catLabel = NSTextField(labelWithString: title)
+                catLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+                catLabel.textColor = catColor
+                stack.addArrangedSubview(catLabel)
 
                 for item in items {
-                    let countStr = item.count > 1 ? "×\(item.count)  " : ""
-                    let line = NSTextField(wrappingLabelWithString: "    \(countStr)\(item.name)  — \(item.reason)")
-                    line.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-                    line.textColor = .secondaryLabelColor
-                    line.preferredMaxLayoutWidth = 416
-                    stack.addArrangedSubview(line)
+                    let row = makeFindingRow(item)
+                    stack.addArrangedSubview(row)
                 }
+
+                addSpacer(to: stack, height: 2)
             }
         }
 
         // ── Sizing ────────────────────────────────────────────────────
         scroll.documentView = stack
         stack.layoutSubtreeIfNeeded()
-        let height = min(stack.fittingSize.height + 8, 700)
-        container.frame = NSRect(x: 0, y: 0, width: 460, height: height)
+        let height = min(stack.fittingSize.height + 8, 600)
+        let width = contentWidth + 40
+        container.frame = NSRect(x: 0, y: 0, width: width, height: height)
         scroll.frame = container.bounds
         self.view = container
-        self.preferredContentSize = NSSize(width: 460, height: height)
+        self.preferredContentSize = NSSize(width: width, height: height)
     }
 
-    private func addSeparator(to stack: NSStackView) {
-        let sep = NSBox()
-        sep.boxType = .separator
-        sep.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(sep)
-        sep.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+    // ── Chunk row ─────────────────────────────────────────────────────
+    private func makeChunkRow(_ chunk: ChunkResult) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        // Mini bar
+        let miniBar = NSView()
+        miniBar.translatesAutoresizingMaskIntoConstraints = false
+        miniBar.wantsLayer = true
+        miniBar.layer?.cornerRadius = 1.5
+        miniBar.layer?.backgroundColor = chunk.color.cgColor
+        row.addSubview(miniBar)
+
+        let pct = NSTextField(labelWithString: "\(Int(chunk.score))%")
+        pct.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        pct.textColor = chunk.color
+        pct.alignment = .right
+        pct.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(pct)
+
+        let preview = String(chunk.text.prefix(55)).replacingOccurrences(of: "\n", with: " ")
+        let suffix = chunk.text.count > 55 ? "..." : ""
+        let text = NSTextField(labelWithString: "\(preview)\(suffix)")
+        text.font = .systemFont(ofSize: 10)
+        text.textColor = .secondaryLabelColor
+        text.lineBreakMode = .byTruncatingTail
+        text.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(text)
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 22),
+            row.widthAnchor.constraint(equalToConstant: contentWidth),
+            miniBar.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            miniBar.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            miniBar.widthAnchor.constraint(equalToConstant: 3),
+            miniBar.heightAnchor.constraint(equalToConstant: 14),
+            pct.leadingAnchor.constraint(equalTo: miniBar.trailingAnchor, constant: 6),
+            pct.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            pct.widthAnchor.constraint(equalToConstant: 32),
+            text.leadingAnchor.constraint(equalTo: pct.trailingAnchor, constant: 6),
+            text.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            text.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
+        ])
+
+        return row
+    }
+
+    // ── Finding row ───────────────────────────────────────────────────
+    private func makeFindingRow(_ item: Finding) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 6
+        row.alignment = .firstBaseline
+
+        let countStr = item.count > 1 ? "\(item.count)x " : ""
+        let name = NSTextField(labelWithString: "\(countStr)\(item.name)")
+        name.font = .systemFont(ofSize: 10, weight: .medium)
+        name.textColor = .labelColor
+        name.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+
+        let reason = NSTextField(labelWithString: item.reason)
+        reason.font = .systemFont(ofSize: 10)
+        reason.textColor = .tertiaryLabelColor
+        reason.lineBreakMode = .byTruncatingTail
+
+        row.addArrangedSubview(name)
+        row.addArrangedSubview(reason)
+
+        return row
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────
+    private func makeSectionHeader(_ title: String) -> NSTextField {
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .labelColor
+        return label
+    }
+
+    private func addDivider(to stack: NSStackView) {
+        let line = NSView()
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.wantsLayer = true
+        line.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        stack.addArrangedSubview(line)
+        NSLayoutConstraint.activate([
+            line.widthAnchor.constraint(equalToConstant: contentWidth),
+            line.heightAnchor.constraint(equalToConstant: 1),
+        ])
+    }
+
+    private func addSpacer(to stack: NSStackView, height: CGFloat) {
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(spacer)
+        spacer.heightAnchor.constraint(equalToConstant: height).isActive = true
     }
 }
 
@@ -1323,7 +1394,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.title = " slop"
+            button.title = "slop"
             button.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
         }
 
@@ -1333,10 +1404,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.delegate = self
         registerHotKey()
 
-        let n = NSUserNotification()
-        n.title = "Slop Detector"
-        n.informativeText = "Running (\(sensitivity.menuLabel)). Press ⌘⇧D with text selected."
-        NSUserNotificationCenter.default.deliver(n)
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+        sendNotification(title: "Slop Detector", body: "Running (\(sensitivity.menuLabel)). Press \u{2318}\u{21E7}D with text selected.")
+    }
+
+    func sendNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
     func rebuildMenu() {
@@ -1367,7 +1444,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         sensitivity = level
         rebuildMenu()
         if let button = statusItem.button {
-            button.title = " slop·\(sensitivity.menuLabel.prefix(1).lowercased())"
+            button.title = "slop"
         }
     }
 
@@ -1410,10 +1487,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             } else if let text = pasteboard.string(forType: .string), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 self.runScan(text)
             } else {
-                let n = NSUserNotification()
-                n.title = "Slop Detector"
-                n.informativeText = "No text selected. Highlight text first."
-                NSUserNotificationCenter.default.deliver(n)
+                self.sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first.")
             }
         }
     }
@@ -1511,11 +1585,4 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
-
-class NotificationDelegate: NSObject, NSUserNotificationCenterDelegate {
-    func userNotificationCenter(_ center: NSUserNotificationCenter, shouldPresent notification: NSUserNotification) -> Bool { true }
-}
-let notifDelegate = NotificationDelegate()
-NSUserNotificationCenter.default.delegate = notifDelegate
-
 app.run()

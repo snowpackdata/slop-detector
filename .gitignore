@@ -2,3 +2,4 @@ slop-detector
 .DS_Store
 .build/
 model/
+Slop Detector.app/

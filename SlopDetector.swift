@@ -3,7 +3,7 @@ import Carbon
 import CoreML
 import UserNotifications
 
-let appVersion = "1.1.0"
+let appVersion = "1.2.0"
 let repoOwner = "snowpackdata"
 let repoName = "slop-detector"
 
@@ -1482,37 +1482,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc func scanSelected() {
         dismissPopover()
 
-        // Try reading selected text directly via Accessibility API (no clipboard needed)
-        if let text = getSelectedText(), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        // 1. Try Accessibility API — reads selected text directly, no clipboard
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedElement: AnyObject?
+        var selectedText: AnyObject?
+
+        if AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success,
+           AXUIElementCopyAttributeValue(focusedElement as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedText) == .success,
+           let text = selectedText as? String,
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             runScan(text)
             return
         }
 
-        // Fallback: scan whatever's on the clipboard
-        if let text = NSPasteboard.general.string(forType: .string),
-           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            runScan(text)
-        } else {
-            sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first, or copy text and use Scan Clipboard.")
+        // 2. AX failed — simulate ⌘C and read clipboard
+        let pasteboard = NSPasteboard.general
+        let source = CGEventSource(stateID: .hidSystemState)
+        let cDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)
+        let cUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
+        cDown?.flags = .maskCommand
+        cUp?.flags = .maskCommand
+        cDown?.post(tap: .cghidEventTap)
+        cUp?.post(tap: .cghidEventTap)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self = self else { return }
+            if let text = pasteboard.string(forType: .string),
+               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.runScan(text)
+            } else {
+                self.sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first.")
+            }
         }
-    }
-
-    private func getSelectedText() -> String? {
-        let systemWide = AXUIElementCreateSystemWide()
-        var focusedElement: AnyObject?
-
-        // Get the focused UI element
-        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success else {
-            return nil
-        }
-
-        // Read its selected text
-        var selectedText: AnyObject?
-        guard AXUIElementCopyAttributeValue(focusedElement as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedText) == .success else {
-            return nil
-        }
-
-        return selectedText as? String
     }
 
     @objc func scanFromClipboard() {

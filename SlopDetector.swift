@@ -1124,12 +1124,14 @@ class ResultViewController: NSViewController {
 
 // MARK: - Menu Bar App
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var statusItem: NSStatusItem!
     var hotKeyRef: EventHotKeyRef?
     var popover = NSPopover()
     let scanner = SlopScanner()
     var sensitivity: Sensitivity = .high
+    var clickMonitor: Any?
+    var keyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1141,6 +1143,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
         registerHotKey()
 
         let n = NSUserNotification()
@@ -1258,11 +1261,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         print("══════════════════════════════════════════════\n")
 
-        // Popover
+        // Popover — dismiss any existing one first
+        dismissPopover()
         popover.contentViewController = ResultViewController(docResult: result, text: text)
         if let button = statusItem.button {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
+        installDismissMonitors()
+    }
+
+    // ── Popover dismissal ─────────────────────────────────────────────
+    func installDismissMonitors() {
+        removeDismissMonitors()
+
+        // Click anywhere outside the popover → dismiss
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.dismissPopover()
+        }
+
+        // Escape key → dismiss
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 53 { // Escape
+                self?.dismissPopover()
+                return nil
+            }
+            return event
+        }
+    }
+
+    func removeDismissMonitors() {
+        if let m = clickMonitor { NSEvent.removeMonitor(m); clickMonitor = nil }
+        if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+    }
+
+    @objc func dismissPopover() {
+        if popover.isShown { popover.performClose(nil) }
+        removeDismissMonitors()
+    }
+
+    // NSPopoverDelegate — clean up monitors when popover closes for any reason
+    func popoverDidClose(_ notification: Notification) {
+        removeDismissMonitors()
     }
 
     @objc func quit() {

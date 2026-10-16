@@ -1480,65 +1480,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc func scanSelected() {
-        // Dismiss any open popover so the target app has focus
         dismissPopover()
 
-        let pasteboard = NSPasteboard.general
-        let savedChangeCount = pasteboard.changeCount
+        // Try reading selected text directly via Accessibility API (no clipboard needed)
+        if let text = getSelectedText(), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            runScan(text)
+            return
+        }
 
-        // Try AppleScript first — it's more reliable than CGEvent for ⌘C
-        DispatchQueue.global(qos: .userInitiated).async {
-            let script = NSAppleScript(source: """
-                tell application "System Events"
-                    keystroke "c" using command down
-                end tell
-            """)
-            var error: NSDictionary?
-            script?.executeAndReturnError(&error)
-
-            // Wait for clipboard, then scan on main thread
-            Thread.sleep(forTimeInterval: 0.3)
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-
-                if pasteboard.changeCount != savedChangeCount,
-                   let text = pasteboard.string(forType: .string),
-                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.runScan(text)
-                } else {
-                    // AppleScript didn't work — try CGEvent as fallback
-                    self.tryCGEventCopy(savedChangeCount: savedChangeCount)
-                }
-            }
+        // Fallback: scan whatever's on the clipboard
+        if let text = NSPasteboard.general.string(forType: .string),
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            runScan(text)
+        } else {
+            sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first, or copy text and use Scan Clipboard.")
         }
     }
 
-    private func tryCGEventCopy(savedChangeCount: Int) {
-        let source = CGEventSource(stateID: .hidSystemState)
-        let cDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)
-        let cUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
-        cDown?.flags = .maskCommand
-        cUp?.flags = .maskCommand
-        cDown?.post(tap: .cghidEventTap)
-        cUp?.post(tap: .cghidEventTap)
+    private func getSelectedText() -> String? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedElement: AnyObject?
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self = self else { return }
-            let pasteboard = NSPasteboard.general
-
-            if pasteboard.changeCount != savedChangeCount,
-               let text = pasteboard.string(forType: .string),
-               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                self.runScan(text)
-            } else if let text = pasteboard.string(forType: .string),
-                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // Neither method changed the clipboard — scan what's there
-                self.runScan(text)
-            } else {
-                self.sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first.")
-            }
+        // Get the focused UI element
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success else {
+            return nil
         }
+
+        // Read its selected text
+        var selectedText: AnyObject?
+        guard AXUIElementCopyAttributeValue(focusedElement as! AXUIElement, kAXSelectedTextAttribute as CFString, &selectedText) == .success else {
+            return nil
+        }
+
+        return selectedText as? String
     }
 
     @objc func scanFromClipboard() {

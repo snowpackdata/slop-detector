@@ -3,7 +3,7 @@ import Carbon
 import CoreML
 import UserNotifications
 
-let appVersion = "1.2.0"
+let appVersion = "1.2.1"
 let repoOwner = "snowpackdata"
 let repoName = "slop-detector"
 
@@ -1409,7 +1409,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         registerHotKey()
 
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
-        sendNotification(title: "Slop Detector", body: "Running (\(sensitivity.menuLabel)). Press \u{2318}\u{21E7}D with text selected.")
+
+        // Prompt for Accessibility permission if not granted
+        let trusted = AXIsProcessTrustedWithOptions(
+            [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        )
+        if trusted {
+            sendNotification(title: "Slop Detector", body: "Running (\(sensitivity.menuLabel)). Press \u{2318}\u{21E7}D with text selected.")
+        } else {
+            sendNotification(title: "Slop Detector", body: "Grant Accessibility permission in System Settings, then restart.")
+        }
         checkForUpdates(silent: true)
     }
 
@@ -1495,23 +1504,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
-        // 2. AX failed — simulate ⌘C and read clipboard
+        // 2. AX API didn't return selected text — simulate ⌘C
         let pasteboard = NSPasteboard.general
-        let source = CGEventSource(stateID: .hidSystemState)
+        let savedCount = pasteboard.changeCount
+
+        let source = CGEventSource(stateID: .combinedSessionState)
         let cDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)
         let cUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
         cDown?.flags = .maskCommand
         cUp?.flags = .maskCommand
-        cDown?.post(tap: .cghidEventTap)
-        cUp?.post(tap: .cghidEventTap)
+        cDown?.post(tap: .cgSessionEventTap)
+        cUp?.post(tap: .cgSessionEventTap)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self = self else { return }
-            if let text = pasteboard.string(forType: .string),
+            // Only scan if clipboard actually changed — otherwise nothing was selected
+            if pasteboard.changeCount != savedCount,
+               let text = pasteboard.string(forType: .string),
                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 self.runScan(text)
             } else {
-                self.sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first.")
+                self.sendNotification(title: "Slop Detector",
+                    body: "Couldn't read selection. Copy text first (⌘C), then use Scan Clipboard.")
             }
         }
     }

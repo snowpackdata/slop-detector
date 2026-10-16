@@ -25,6 +25,7 @@ app: build setup
 	@cp Info.plist "$(APP_NAME)/Contents/"
 	@cp AppIcon.icns "$(APP_NAME)/Contents/Resources/"
 	@cp -R model "$(APP_NAME)/Contents/Resources/model"
+	@codesign --force --deep --sign - "$(APP_NAME)"
 	@echo "Built $(APP_NAME)"
 
 install: app

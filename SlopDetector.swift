@@ -1483,6 +1483,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let pasteboard = NSPasteboard.general
         let savedChangeCount = pasteboard.changeCount
 
+        // Simulate ⌘C to copy the selection
         let source = CGEventSource(stateID: .combinedSessionState)
         let cDown = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: true)
         let cUp = CGEvent(keyboardEventSource: source, virtualKey: 0x08, keyDown: false)
@@ -1491,13 +1492,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         cDown?.post(tap: .cgSessionEventTap)
         cUp?.post(tap: .cgSessionEventTap)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+        // Wait for clipboard to update, retry once if slow
+        waitForClipboard(savedChangeCount: savedChangeCount, attempt: 0)
+    }
+
+    private func waitForClipboard(savedChangeCount: Int, attempt: Int) {
+        let delay: Double = attempt == 0 ? 0.2 : 0.3
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self = self else { return }
+            let pasteboard = NSPasteboard.general
+
             if pasteboard.changeCount != savedChangeCount,
-               let text = pasteboard.string(forType: .string), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+               let text = pasteboard.string(forType: .string),
+               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 self.runScan(text)
-            } else if let text = pasteboard.string(forType: .string), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                self.runScan(text)
+            } else if attempt == 0 {
+                // Retry once — some apps are slow to respond to ⌘C
+                self.waitForClipboard(savedChangeCount: savedChangeCount, attempt: 1)
             } else {
                 self.sendNotification(title: "Slop Detector", body: "No text selected. Highlight text first.")
             }

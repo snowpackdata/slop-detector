@@ -3,7 +3,7 @@ import Carbon
 import CoreML
 import UserNotifications
 
-let appVersion = "1.2.1"
+let appVersion = "1.3.0"
 let repoOwner = "snowpackdata"
 let repoName = "slop-detector"
 
@@ -543,21 +543,23 @@ class SlopScanner {
         // 6. Watermarks
         findings += watermarkDetection(text)
 
-        // Compute heuristic score: weighted sum of findings, normalized by word count
+        // Compute heuristic score
         let rawScore = findings.reduce(0.0) { total, f in
             total + f.scoreWeight * Double(f.count)
         }
-        let density = rawScore / Double(max(wordCount, 1)) * 8.0
-        let heuristicScore = min(100.0, max(0.0, density))
+        // Scale so that typical AI text (3 phrases + 2 grammar flags in 200 words) scores ~50%
+        // sqrt compresses the range: light signals → low score, heavy signals → high score
+        let normalized = sqrt(rawScore / Double(max(wordCount, 1)))
+        let heuristicScore = min(100.0, max(0.0, normalized * 140.0))
 
         // Neural score (CoreML model)
         let neuralProb = neuralScorer.score(text)
         let neuralScore = neuralProb.map { $0 * 100.0 }
 
-        // Blend: 60% neural + 40% heuristic when model available
+        // MECE: take the higher signal. Only "Human" if both say it's clean.
         let score: Double
         if let ns = neuralScore {
-            score = min(100.0, max(0.0, 0.6 * ns + 0.4 * heuristicScore))
+            score = max(ns, heuristicScore)
         } else {
             score = heuristicScore
         }
@@ -1184,10 +1186,21 @@ class ResultViewController: NSViewController {
 
         stack.addArrangedSubview(headerRow)
 
-        // Verdict + meta
+        // Verdict + score breakdown
         let hasNeural = docResult.chunks.contains { $0.neuralScore != nil }
-        let method = hasNeural ? "Neural + Rules" : "Rules only"
-        let verdictLine = NSTextField(labelWithString: "\(docResult.verdict)  \u{00B7}  \(docResult.totalWordCount) words  \u{00B7}  \(method)")
+        var parts: [String] = [docResult.verdict, "\(docResult.totalWordCount) words"]
+        if hasNeural {
+            // Show which detector is driving the score
+            let avgNeural = docResult.chunks.compactMap { $0.neuralScore }.reduce(0, +)
+                / Double(max(1, docResult.chunks.compactMap({ $0.neuralScore }).count))
+            let avgHeuristic = docResult.chunks.map { $0.heuristicScore }.reduce(0, +)
+                / Double(max(1, docResult.chunks.count))
+            parts.append("Neural \(Int(avgNeural))%")
+            parts.append("Rules \(Int(avgHeuristic))%")
+        } else {
+            parts.append("Rules only")
+        }
+        let verdictLine = NSTextField(labelWithString: parts.joined(separator: "  \u{00B7}  "))
         verdictLine.font = .systemFont(ofSize: 11)
         verdictLine.textColor = .secondaryLabelColor
         stack.addArrangedSubview(verdictLine)
@@ -1414,10 +1427,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let trusted = AXIsProcessTrustedWithOptions(
             [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
         )
+
+        let neuralStatus = scanner.neuralScorer.isAvailable ? "Neural active" : "Heuristic only"
         if trusted {
-            sendNotification(title: "Slop Detector", body: "Running (\(sensitivity.menuLabel)). Press \u{2318}\u{21E7}D with text selected.")
+            sendNotification(title: "Slop Detector", body: "\(neuralStatus). Press \u{2318}\u{21E7}D with text selected.")
         } else {
-            sendNotification(title: "Slop Detector", body: "Grant Accessibility permission in System Settings, then restart.")
+            sendNotification(title: "Slop Detector", body: "\(neuralStatus). Grant Accessibility permission, then restart.")
         }
         checkForUpdates(silent: true)
     }

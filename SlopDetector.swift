@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon
+import CoreML
 
 // MARK: - Sensitivity
 
@@ -89,7 +90,9 @@ struct ChunkResult {
     let text: String
     let findings: [Finding]
     let wordCount: Int
-    let score: Double  // 0-100 AI likelihood
+    let score: Double  // 0-100 AI likelihood (blended)
+    let neuralScore: Double?  // 0-100 from CoreML model, nil if unavailable
+    let heuristicScore: Double  // 0-100 from rules
 
     var verdict: String {
         switch score {
@@ -148,6 +151,11 @@ struct DocumentResult {
 // MARK: - Detection Engine
 
 class SlopScanner {
+    let neuralScorer: NeuralScorer
+
+    init() {
+        self.neuralScorer = NeuralScorer()
+    }
 
     // ── Unicode rules ─────────────────────────────────────────────────
     struct CharRule {
@@ -488,7 +496,7 @@ class SlopScanner {
         let wordCount = words.count
 
         guard wordCount >= 5 else {
-            return ChunkResult(text: text, findings: [], wordCount: wordCount, score: 0)
+            return ChunkResult(text: text, findings: [], wordCount: wordCount, score: 0, neuralScore: nil, heuristicScore: 0)
         }
 
         // 1. Invisible Unicode
@@ -530,16 +538,27 @@ class SlopScanner {
         // 6. Watermarks
         findings += watermarkDetection(text)
 
-        // Compute score: weighted sum of findings, normalized by word count
+        // Compute heuristic score: weighted sum of findings, normalized by word count
         let rawScore = findings.reduce(0.0) { total, f in
             total + f.scoreWeight * Double(f.count)
         }
-        // Normalize: more findings per word = higher score
-        // A 50-word chunk with 3 phrase hits and 2 grammar flags should score ~60-70%
         let density = rawScore / Double(max(wordCount, 1)) * 8.0
-        let score = min(100.0, max(0.0, density))
+        let heuristicScore = min(100.0, max(0.0, density))
 
-        return ChunkResult(text: text, findings: findings, wordCount: wordCount, score: score)
+        // Neural score (CoreML model)
+        let neuralProb = neuralScorer.score(text)
+        let neuralScore = neuralProb.map { $0 * 100.0 }
+
+        // Blend: 60% neural + 40% heuristic when model available
+        let score: Double
+        if let ns = neuralScore {
+            score = min(100.0, max(0.0, 0.6 * ns + 0.4 * heuristicScore))
+        } else {
+            score = heuristicScore
+        }
+
+        return ChunkResult(text: text, findings: findings, wordCount: wordCount,
+                           score: score, neuralScore: neuralScore, heuristicScore: heuristicScore)
     }
 
     // ── Character scanning ────────────────────────────────────────────
@@ -931,6 +950,170 @@ class SlopScanner {
 }
 
 
+// MARK: - WordPiece Tokenizer + CoreML Scorer
+
+class NeuralScorer {
+    let model: MLModel?
+    let vocab: [String: Int]
+    let clsId: Int32 = 101
+    let sepId: Int32 = 102
+    let padId: Int32 = 0
+    let unkId: Int32 = 100
+    let maxLength = 512
+
+    init() {
+        // Load vocabulary from tokenizer.json
+        let execPath = ProcessInfo.processInfo.arguments[0]
+        let execDir = (execPath as NSString).deletingLastPathComponent
+        let modelDir = (execDir as NSString).appendingPathComponent("model")
+        let tokenizerPath = (modelDir as NSString).appendingPathComponent("tokenizer.json")
+        let mlpackagePath = (modelDir as NSString).appendingPathComponent("SlopDetectorModel.mlpackage")
+
+        // Parse vocab
+        var loadedVocab: [String: Int] = [:]
+        if let data = FileManager.default.contents(atPath: tokenizerPath),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let modelSection = json["model"] as? [String: Any],
+           let vocabDict = modelSection["vocab"] as? [String: Int] {
+            loadedVocab = vocabDict
+            print("[Neural] Loaded \(loadedVocab.count) vocab entries")
+        } else {
+            print("[Neural] Failed to load tokenizer at \(tokenizerPath)")
+        }
+        self.vocab = loadedVocab
+
+        // Load CoreML model
+        if let compiledURL = try? MLModel.compileModel(at: URL(fileURLWithPath: mlpackagePath)) {
+            self.model = try? MLModel(contentsOf: compiledURL)
+            if self.model != nil {
+                print("[Neural] CoreML model loaded")
+            } else {
+                print("[Neural] Failed to init MLModel")
+            }
+        } else {
+            self.model = nil
+            print("[Neural] Failed to compile mlpackage at \(mlpackagePath)")
+        }
+    }
+
+    var isAvailable: Bool { model != nil && !vocab.isEmpty }
+
+    /// Returns AI probability 0.0-1.0, or nil if model unavailable
+    func score(_ text: String) -> Double? {
+        guard let model = model, !vocab.isEmpty else { return nil }
+
+        let tokenIds = wordPieceTokenize(text)
+
+        var inputIds = [Int32](repeating: padId, count: maxLength)
+        var attentionMask = [Int32](repeating: 0, count: maxLength)
+
+        inputIds[0] = clsId
+        attentionMask[0] = 1
+
+        let tokenCount = min(tokenIds.count, maxLength - 2)
+        for i in 0..<tokenCount {
+            inputIds[i + 1] = tokenIds[i]
+            attentionMask[i + 1] = 1
+        }
+        inputIds[tokenCount + 1] = sepId
+        attentionMask[tokenCount + 1] = 1
+
+        guard let inputIdsArray = try? MLMultiArray(shape: [1, NSNumber(value: maxLength)], dataType: .int32),
+              let attMaskArray = try? MLMultiArray(shape: [1, NSNumber(value: maxLength)], dataType: .int32) else {
+            return nil
+        }
+
+        for i in 0..<maxLength {
+            inputIdsArray[[0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: inputIds[i])
+            attMaskArray[[0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: attentionMask[i])
+        }
+
+        guard let provider = try? MLDictionaryFeatureProvider(dictionary: [
+            "input_ids": MLFeatureValue(multiArray: inputIdsArray),
+            "attention_mask": MLFeatureValue(multiArray: attMaskArray)
+        ]),
+        let output = try? model.prediction(from: provider),
+        let logits = output.featureValue(for: "logits")?.multiArrayValue else {
+            return nil
+        }
+
+        let humanLogit = Double(truncating: logits[[0, 0] as [NSNumber]])
+        let aiLogit = Double(truncating: logits[[0, 1] as [NSNumber]])
+        let maxLogit = max(humanLogit, aiLogit)
+        let expHuman = exp(humanLogit - maxLogit)
+        let expAI = exp(aiLogit - maxLogit)
+        return expAI / (expHuman + expAI)
+    }
+
+    /// Basic WordPiece tokenization (matches BERT/DistilBERT behavior)
+    private func wordPieceTokenize(_ text: String) -> [Int32] {
+        let cleaned = text.lowercased()
+        // Split on whitespace and punctuation boundaries
+        let words = splitOnPunctuationAndWhitespace(cleaned)
+        var allTokens: [Int32] = []
+
+        for word in words {
+            if word.isEmpty { continue }
+            let tokens = subwordTokenize(word)
+            allTokens.append(contentsOf: tokens)
+        }
+
+        return allTokens
+    }
+
+    private func splitOnPunctuationAndWhitespace(_ text: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        for ch in text {
+            if ch.isWhitespace {
+                if !current.isEmpty { result.append(current); current = "" }
+            } else if ch.isPunctuation || ch == "'" || ch == "\"" {
+                if !current.isEmpty { result.append(current); current = "" }
+                result.append(String(ch))
+            } else {
+                current.append(ch)
+            }
+        }
+        if !current.isEmpty { result.append(current) }
+        return result
+    }
+
+    private func subwordTokenize(_ word: String) -> [Int32] {
+        // Try whole word first
+        if let id = vocab[word] { return [Int32(id)] }
+
+        // WordPiece: greedily match longest prefix, then ##subword pieces
+        var tokens: [Int32] = []
+        var start = word.startIndex
+        var isFirst = true
+
+        while start < word.endIndex {
+            var end = word.endIndex
+            var matched = false
+
+            while start < end {
+                let substr = isFirst ? String(word[start..<end]) : "##" + String(word[start..<end])
+                if let id = vocab[substr] {
+                    tokens.append(Int32(id))
+                    start = end
+                    matched = true
+                    break
+                }
+                end = word.index(before: end)
+            }
+
+            if !matched {
+                tokens.append(unkId)
+                start = word.index(after: start)
+            }
+            isFirst = false
+        }
+
+        return tokens
+    }
+}
+
+
 // MARK: - Popover Result View
 
 class ResultViewController: NSViewController {
@@ -974,7 +1157,9 @@ class ResultViewController: NSViewController {
         header.textColor = docResult.overallColor
         stack.addArrangedSubview(header)
 
-        let verdictLine = NSTextField(labelWithString: "\(docResult.verdict) · \(docResult.totalWordCount) words · \(docResult.sensitivity.menuLabel) sensitivity")
+        let hasNeural = docResult.chunks.contains { $0.neuralScore != nil }
+        let modelTag = hasNeural ? " · Neural+Heuristic" : " · Heuristic only"
+        let verdictLine = NSTextField(labelWithString: "\(docResult.verdict) · \(docResult.totalWordCount) words · \(docResult.sensitivity.menuLabel)\(modelTag)")
         verdictLine.font = .systemFont(ofSize: 11)
         verdictLine.textColor = .secondaryLabelColor
         stack.addArrangedSubview(verdictLine)
@@ -1013,10 +1198,11 @@ class ResultViewController: NSViewController {
             chunkHeader.textColor = .labelColor
             stack.addArrangedSubview(chunkHeader)
 
-            for (i, chunk) in docResult.chunks.enumerated() {
+            for (_, chunk) in docResult.chunks.enumerated() {
                 let chunkPct = Int(chunk.score)
-                let preview = String(chunk.text.prefix(70)).replacingOccurrences(of: "\n", with: " ")
+                let preview = String(chunk.text.prefix(60)).replacingOccurrences(of: "\n", with: " ")
                 let flagCount = chunk.findings.count
+                let neuralLabel = chunk.neuralScore.map { "N:\(Int($0))%" } ?? ""
 
                 let chunkView = NSView()
                 chunkView.translatesAutoresizingMaskIntoConstraints = false
@@ -1042,7 +1228,8 @@ class ResultViewController: NSViewController {
                 textLabel.translatesAutoresizingMaskIntoConstraints = false
                 chunkView.addSubview(textLabel)
 
-                let flagLabel = NSTextField(labelWithString: flagCount > 0 ? "\(flagCount) flags" : "")
+                let detailStr = [neuralLabel, flagCount > 0 ? "\(flagCount) flags" : ""].filter { !$0.isEmpty }.joined(separator: " · ")
+                let flagLabel = NSTextField(labelWithString: detailStr)
                 flagLabel.font = .systemFont(ofSize: 9)
                 flagLabel.textColor = .tertiaryLabelColor
                 flagLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -1242,8 +1429,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let result = scanner.scanDocument(text, sensitivity: sensitivity)
 
         // Console
+        let neuralTag: String
+        if let ns = result.chunks.first?.neuralScore, result.chunks.count == 1 {
+            neuralTag = " · Neural: \(Int(ns))%"
+        } else if scanner.neuralScorer.isAvailable {
+            neuralTag = " · Neural active"
+        } else {
+            neuralTag = " · Heuristic only"
+        }
         print("\n══════════════════════════════════════════════")
-        print("  \(Int(result.overallScore))% AI · \(result.verdict) · \(result.totalWordCount) words")
+        print("  \(Int(result.overallScore))% AI · \(result.verdict) · \(result.totalWordCount) words\(neuralTag)")
         print("══════════════════════════════════════════════")
         if result.chunks.count > 1 {
             for (i, chunk) in result.chunks.enumerated() {
